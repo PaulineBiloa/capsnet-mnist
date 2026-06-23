@@ -1400,10 +1400,10 @@ explorer le comportement du modele de maniere interactive.
             '<div class="arch-block" style="border-left-color:#3fb950;">'
             "<h4>Informations auteur</h4>"
             '<p style="color:#c9d1d9;">'
-            "Nom &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;: <b>Votre Nom</b><br/>"
-            "Institution : <b>Votre Institution</b><br/>"
-            "Email &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;: <b>votre.email@domaine.com</b><br/>"
-            "GitHub &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;: <b>github.com/votre-profil</b>"
+            "Nom &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;: <b>BILOA Pauline & NGBAYAFOU Lynette</b><br/>"
+            "Institution : <b>Ecole Normale Supérieure de Yaoundé </b><br/>"
+            "Email &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;: <b>line@gmail.com</b><br/>"
+            "GitHub &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;: <b>github.com/PaulineBiloa</b>"
             "</p>"
             "</div>",
             unsafe_allow_html=True,
