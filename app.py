@@ -4,10 +4,9 @@ Capsule Network for MNIST Classification and Reconstruction
 Based on: Sabour, Frosst & Hinton (2017) — "Dynamic Routing Between Capsules"
 """
 
-import os
 import io
+import sys
 import time
-import random
 import numpy as np
 import streamlit as st
 import plotly.graph_objects as go
@@ -16,35 +15,17 @@ from plotly.subplots import make_subplots
 from PIL import Image
 import torch
 import torch.nn.functional as F
-from torchvision import transforms
-from sklearn.metrics import (
-    classification_report,
-    confusion_matrix,
-    precision_score,
-    recall_score,
-    f1_score,
-)
+from torchvision import transforms, datasets
+from torch.utils.data import DataLoader
+from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.decomposition import PCA
 
 # ---------------------------------------------------------------------------
-# Optional project imports — graceful fallback when modules are absent
+# Project imports — model.py / train.py / utils.py
 # ---------------------------------------------------------------------------
-try:
-    from model import CapsNet
-    MODEL_AVAILABLE = True
-except ImportError:
-    MODEL_AVAILABLE = False
-
-try:
-    from train import train_model, evaluate_model
-    TRAIN_AVAILABLE = True
-except ImportError:
-    TRAIN_AVAILABLE = False
-
-try:
-    from utils import load_data
-    UTILS_AVAILABLE = True
-except ImportError:
-    UTILS_AVAILABLE = False
+from model import CapsNet, CapsLoss
+from train import train, test
+from utils import set_seed, get_dataloaders
 
 # ---------------------------------------------------------------------------
 # Page configuration
@@ -57,34 +38,27 @@ st.set_page_config(
 )
 
 # ---------------------------------------------------------------------------
-# Global CSS — clean, academic, no emoji residue
+# Global CSS
 # ---------------------------------------------------------------------------
 st.markdown(
     """
     <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
 
-    html, body, [class*="css"] {
-        font-family: 'Inter', sans-serif;
-    }
+    html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
 
-    /* Sidebar */
     section[data-testid="stSidebar"] {
         background: #0f1117;
         border-right: 1px solid #1e2130;
     }
-    section[data-testid="stSidebar"] * {
-        color: #c9d1d9 !important;
-    }
+    section[data-testid="stSidebar"] * { color: #c9d1d9 !important; }
 
-    /* Main background */
     .main .block-container {
         background: #0d1117;
         padding: 2rem 3rem;
         max-width: 1300px;
     }
 
-    /* KPI card */
     .kpi-card {
         background: #161b22;
         border: 1px solid #21262d;
@@ -107,7 +81,6 @@ st.markdown(
         margin-top: 0.4rem;
     }
 
-    /* Section header */
     .section-title {
         font-size: 1.6rem;
         font-weight: 600;
@@ -123,7 +96,6 @@ st.markdown(
         line-height: 1.6;
     }
 
-    /* Code-like badge */
     .badge {
         display: inline-block;
         background: #1f2937;
@@ -135,7 +107,6 @@ st.markdown(
         margin: 0.15rem;
     }
 
-    /* Architecture block */
     .arch-block {
         background: #161b22;
         border: 1px solid #21262d;
@@ -150,14 +121,8 @@ st.markdown(
         font-size: 0.95rem;
         font-family: 'JetBrains Mono', monospace;
     }
-    .arch-block p {
-        color: #8b949e;
-        margin: 0;
-        font-size: 0.88rem;
-        line-height: 1.5;
-    }
+    .arch-block p { color: #8b949e; margin: 0; font-size: 0.88rem; line-height: 1.5; }
 
-    /* Info box */
     .info-box {
         background: #0d2137;
         border: 1px solid #1d4ed8;
@@ -169,15 +134,6 @@ st.markdown(
         line-height: 1.6;
     }
 
-    /* Metric row */
-    .metric-row {
-        display: flex;
-        gap: 1rem;
-        flex-wrap: wrap;
-        margin-bottom: 1.5rem;
-    }
-
-    /* Streamlit overrides */
     .stButton > button {
         background: #1d4ed8;
         color: #ffffff;
@@ -187,9 +143,8 @@ st.markdown(
         padding: 0.5rem 1.4rem;
         transition: background 0.2s;
     }
-    .stButton > button:hover {
-        background: #2563eb;
-    }
+    .stButton > button:hover { background: #2563eb; }
+
     .stSelectbox label, .stSlider label, .stNumberInput label {
         color: #8b949e !important;
         font-size: 0.88rem;
@@ -198,44 +153,128 @@ st.markdown(
         color: #58a6ff !important;
         font-family: 'JetBrains Mono', monospace;
     }
-    h1, h2, h3 {
-        color: #e6edf3 !important;
-    }
-    p, li {
-        color: #c9d1d9;
-    }
-    hr {
-        border-color: #21262d;
-    }
+    h1, h2, h3 { color: #e6edf3 !important; }
+    p, li { color: #c9d1d9; }
+    hr { border-color: #21262d; }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
 # ---------------------------------------------------------------------------
-# Session state defaults
+# Session state
 # ---------------------------------------------------------------------------
-if "training_history" not in st.session_state:
-    st.session_state.training_history = None
-if "model" not in st.session_state:
-    st.session_state.model = None
-if "dataset_loaded" not in st.session_state:
-    st.session_state.dataset_loaded = False
-if "eval_results" not in st.session_state:
-    st.session_state.eval_results = None
+for key, default in {
+    "training_history": None,
+    "model": None,
+    "eval_data": None,       # dict: y_true, y_pred, capsule_vectors, images
+    "train_loader": None,
+    "test_loader": None,
+}.items():
+    if key not in st.session_state:
+        st.session_state[key] = default
 
 # ---------------------------------------------------------------------------
-# Sidebar navigation
+# Helpers
+# ---------------------------------------------------------------------------
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+PLOTLY_BASE = dict(
+    plot_bgcolor="#0d1117",
+    paper_bgcolor="#161b22",
+    font=dict(color="#8b949e", family="Inter"),
+)
+AXIS_STYLE = dict(gridcolor="#21262d")
+
+
+@st.cache_resource(show_spinner="Chargement de MNIST…")
+def load_mnist(batch_size: int = 128):
+    """Charge MNIST via get_dataloaders (utils.py) et met en cache."""
+    return get_dataloaders(batch_size)
+
+
+@st.cache_data(show_spinner="Chargement des images brutes MNIST…")
+def load_mnist_raw():
+    """Charge le dataset MNIST sans normalisation, pour la galerie visuelle."""
+    tf = transforms.ToTensor()
+    train_ds = datasets.MNIST(root="./data", train=True, download=True, transform=tf)
+    test_ds  = datasets.MNIST(root="./data", train=False, download=True, transform=tf)
+    return train_ds, test_ds
+
+
+def count_parameters(model: torch.nn.Module) -> int:
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+def tensor_to_numpy_img(t: torch.Tensor) -> np.ndarray:
+    """(1, 28, 28) float tensor → (28, 28) numpy [0, 1]."""
+    return t.squeeze().cpu().numpy()
+
+
+@torch.no_grad()
+def run_full_eval(model: torch.nn.Module, test_loader, device, n_batches: int = 20):
+    """
+    Parcourt n_batches du test loader.
+    Retourne y_true, y_pred, capsule_vectors (N, 10, 16), images (N, 28, 28).
+    """
+    model.eval()
+    all_true, all_pred, all_caps, all_imgs = [], [], [], []
+
+    for i, (data, target) in enumerate(test_loader):
+        if i >= n_batches:
+            break
+        data = data.to(device)
+        v, classes, _ = model(data)          # v: (B, 10, 16)
+        preds = classes.max(dim=1)[1]
+
+        all_true.append(target.cpu().numpy())
+        all_pred.append(preds.cpu().numpy())
+        all_caps.append(v.cpu().numpy())
+        all_imgs.append(data.cpu().numpy())
+
+    return {
+        "y_true": np.concatenate(all_true),
+        "y_pred": np.concatenate(all_pred),
+        "caps":   np.concatenate(all_caps),    # (N, 10, 16)
+        "images": np.concatenate(all_imgs),    # (N, 1, 28, 28)
+    }
+
+
+def plotly_heatmap_img(img: np.ndarray, title: str = "") -> go.Figure:
+    fig = go.Figure(go.Heatmap(z=img, colorscale="gray", showscale=False, zmin=0, zmax=1))
+    fig.update_layout(
+        **PLOTLY_BASE,
+        margin=dict(l=0, r=0, t=30 if title else 0, b=0),
+        height=200,
+        title=dict(text=title, font=dict(color="#8b949e", size=11)),
+    )
+    fig.update_xaxes(visible=False)
+    fig.update_yaxes(visible=False)
+    return fig
+
+
+def styled_kpi(value: str, label: str, extra_style: str = "") -> str:
+    return (
+        f'<div class="kpi-card" style="{extra_style}">'
+        f'<div class="kpi-value">{value}</div>'
+        f'<div class="kpi-label">{label}</div>'
+        f"</div>"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Sidebar
 # ---------------------------------------------------------------------------
 with st.sidebar:
     st.markdown(
         """
-        <div style="padding: 1rem 0 1.5rem 0; border-bottom: 1px solid #21262d; margin-bottom: 1.2rem;">
-            <div style="font-size:1.15rem; font-weight:700; color:#e6edf3; letter-spacing:0.03em;">
+        <div style="padding:1rem 0 1.5rem 0;border-bottom:1px solid #21262d;margin-bottom:1.2rem;">
+            <div style="font-size:1.15rem;font-weight:700;color:#e6edf3;letter-spacing:0.03em;">
                 CapsNet Dashboard
             </div>
-            <div style="font-size:0.75rem; color:#58a6ff; margin-top:0.2rem; font-family:'JetBrains Mono',monospace;">
-                MNIST  •  Dynamic Routing
+            <div style="font-size:0.75rem;color:#58a6ff;margin-top:0.2rem;
+                        font-family:'JetBrains Mono',monospace;">
+                MNIST &nbsp;•&nbsp; Dynamic Routing
             </div>
         </div>
         """,
@@ -259,20 +298,23 @@ with st.sidebar:
     )
 
     st.markdown("<hr/>", unsafe_allow_html=True)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model_status = "charge" if st.session_state.model is not None else "non charge"
+    model_color  = "#3fb950" if st.session_state.model is not None else "#f85149"
     st.markdown(
         f"""
-        <div style="font-size:0.78rem; color:#8b949e;">
+        <div style="font-size:0.78rem;color:#8b949e;">
             <b style="color:#c9d1d9;">Environnement</b><br/>
-            Device : <span style="color:#58a6ff; font-family:'JetBrains Mono',monospace;">{device.upper()}</span><br/>
-            PyTorch : <span style="color:#58a6ff; font-family:'JetBrains Mono',monospace;">{torch.__version__}</span><br/>
-            model.py : <span style="color:{'#3fb950' if MODEL_AVAILABLE else '#f85149'}; font-family:'JetBrains Mono',monospace;">{'OK' if MODEL_AVAILABLE else 'absent'}</span><br/>
-            train.py : <span style="color:{'#3fb950' if TRAIN_AVAILABLE else '#f85149'}; font-family:'JetBrains Mono',monospace;">{'OK' if TRAIN_AVAILABLE else 'absent'}</span><br/>
-            utils.py : <span style="color:{'#3fb950' if UTILS_AVAILABLE else '#f85149'}; font-family:'JetBrains Mono',monospace;">{'OK' if UTILS_AVAILABLE else 'absent'}</span>
+            Device : <span style="color:#58a6ff;font-family:'JetBrains Mono',monospace;">
+                     {DEVICE.type.upper()}</span><br/>
+            PyTorch : <span style="color:#58a6ff;font-family:'JetBrains Mono',monospace;">
+                      {torch.__version__}</span><br/>
+            Modele : <span style="color:{model_color};font-family:'JetBrains Mono',monospace;">
+                     {model_status}</span>
         </div>
         """,
         unsafe_allow_html=True,
     )
+
 
 # ===========================================================================
 # PAGE — ACCUEIL
@@ -281,30 +323,22 @@ if page == "Accueil":
     st.markdown('<div class="section-title">Capsule Networks pour MNIST</div>', unsafe_allow_html=True)
     st.markdown(
         '<div class="section-sub">'
-        "Implementation du modele CapsNet de Sabour, Frosst et Hinton (NeurIPS 2017) pour la classification "
-        "et la reconstruction des chiffres manuscrits du dataset MNIST."
+        "Implementation du modele CapsNet de Sabour, Frosst et Hinton (NeurIPS 2017) pour la "
+        "classification et la reconstruction des chiffres manuscrits du dataset MNIST."
         "</div>",
         unsafe_allow_html=True,
     )
 
-    # KPI row
     col1, col2, col3, col4 = st.columns(4)
-    kpis = [
-        ("99.75 %", "Accuracy cible"),
-        ("10", "Classes MNIST"),
-        ("8", "Dim. capsules digit"),
-        ("3", "Iterations routing"),
-    ]
-    for col, (val, label) in zip([col1, col2, col3, col4], kpis):
+    for col, (val, label) in zip(
+        [col1, col2, col3, col4],
+        [("99.75%", "Accuracy cible"), ("10", "Classes MNIST"),
+         ("16", "Dim. capsules digit"), ("3", "Iterations routing")],
+    ):
         with col:
-            st.markdown(
-                f'<div class="kpi-card"><div class="kpi-value">{val}</div>'
-                f'<div class="kpi-label">{label}</div></div>',
-                unsafe_allow_html=True,
-            )
+            st.markdown(styled_kpi(val, label), unsafe_allow_html=True)
 
     st.markdown("<br/>", unsafe_allow_html=True)
-
     col_left, col_right = st.columns([1.2, 1])
 
     with col_left:
@@ -321,32 +355,27 @@ des groupes de neurones dont le **vecteur d'activation** encode simultanement la
 et les proprietes spatiales d'une entite (position, orientation, echelle, deformation).
 """
         )
-
         st.markdown("### Dynamic Routing")
         st.markdown(
             """
 Le mecanisme de **routage dynamique entre capsules** (Sabour et al., 2017) permet aux
-capsules de niveau inferieur de "voter" pour les capsules de niveau superieur auxquelles
-elles envoient leur information. L'accord entre votes est mesure iterativement, ce qui
-produit une representation hierarchique coherente sans supervision explicite.
+capsules de niveau inferieur de "voter" pour les capsules de niveau superieur. L'accord
+entre votes est mesure iterativement, produisant une representation hierarchique coherente
+sans supervision explicite.
 """
         )
-
         st.markdown("### Avantages vis-a-vis des CNN")
-        advantages = [
+        for adv in [
             "Equivariance aux transformations geometriques",
             "Preservation de la structure spatiale",
             "Reconstruction interpretable par le decodeur",
             "Meilleure generalisation sous faible volume de donnees",
             "Representations hierarchiques explicites",
-        ]
-        for adv in advantages:
+        ]:
             st.markdown(f"- {adv}")
 
     with col_right:
         st.markdown("### Pipeline CapsNet")
-
-        # Architecture flow diagram using Plotly
         steps = [
             "Image MNIST\n(28 x 28)",
             "Convolution\n256 filtres, 9x9",
@@ -355,53 +384,36 @@ produit une representation hierarchique coherente sans supervision explicite.
             "Classification\n(norme du vecteur)",
             "Reconstruction\n(decodeur FC)",
         ]
-        colors = ["#1d4ed8", "#1e40af", "#1d4ed8", "#2563eb", "#3b82f6", "#60a5fa"]
-        y_positions = list(range(len(steps), 0, -1))
+        colors_flow = ["#1d4ed8", "#1e40af", "#1d4ed8", "#2563eb", "#3b82f6", "#60a5fa"]
+        y_pos = list(range(len(steps), 0, -1))
 
         fig_flow = go.Figure()
-        for i, (step, color, y) in enumerate(zip(steps, colors, y_positions)):
+        for i, (step, color, y) in enumerate(zip(steps, colors_flow, y_pos)):
             fig_flow.add_shape(
-                type="rect",
-                x0=0.1, x1=0.9, y0=y - 0.35, y1=y + 0.35,
-                line=dict(color="#58a6ff", width=1.5),
-                fillcolor=color,
-                opacity=0.9,
+                type="rect", x0=0.1, x1=0.9, y0=y - 0.35, y1=y + 0.35,
+                line=dict(color="#58a6ff", width=1.5), fillcolor=color, opacity=0.9,
             )
             fig_flow.add_annotation(
-                x=0.5, y=y,
-                text=step.replace("\n", "<br>"),
-                showarrow=False,
-                font=dict(color="#e6edf3", size=11, family="JetBrains Mono"),
-                align="center",
+                x=0.5, y=y, text=step.replace("\n", "<br>"), showarrow=False,
+                font=dict(color="#e6edf3", size=11, family="JetBrains Mono"), align="center",
             )
             if i < len(steps) - 1:
                 fig_flow.add_annotation(
-                    x=0.5, y=y - 0.35,
-                    ax=0.5, ay=y_positions[i + 1] + 0.35,
+                    x=0.5, y=y - 0.35, ax=0.5, ay=y_pos[i + 1] + 0.35,
                     xref="x", yref="y", axref="x", ayref="y",
-                    showarrow=True,
-                    arrowhead=2,
-                    arrowcolor="#58a6ff",
-                    arrowwidth=2,
+                    showarrow=True, arrowhead=2, arrowcolor="#58a6ff", arrowwidth=2,
                 )
-
         fig_flow.update_layout(
             xaxis=dict(visible=False, range=[0, 1]),
             yaxis=dict(visible=False, range=[0.4, len(steps) + 0.5]),
-            plot_bgcolor="#0d1117",
-            paper_bgcolor="#161b22",
-            margin=dict(l=10, r=10, t=10, b=10),
-            height=480,
+            **PLOTLY_BASE, margin=dict(l=10, r=10, t=10, b=10), height=480,
         )
-        st.plotly_chart(fig_flow, width='stretch')
+        st.plotly_chart(fig_flow,  width='stretch')
 
     st.markdown("<br/>", unsafe_allow_html=True)
     st.markdown(
-        '<div class="info-box">'
-        "<b>Reference :</b> Sara Sabour, Nicholas Frosst, Geoffrey E. Hinton — "
-        "<i>Dynamic Routing Between Capsules</i>, NeurIPS 2017. "
-        "arXiv:1710.09829"
-        "</div>",
+        '<div class="info-box"><b>Reference :</b> Sara Sabour, Nicholas Frosst, Geoffrey E. Hinton — '
+        "<i>Dynamic Routing Between Capsules</i>, NeurIPS 2017. arXiv:1710.09829</div>",
         unsafe_allow_html=True,
     )
 
@@ -420,124 +432,99 @@ elif page == "Dataset MNIST":
         unsafe_allow_html=True,
     )
 
+    # Chargement reel
+    train_ds, test_ds = load_mnist_raw()
+    targets_train = np.array(train_ds.targets)
+
     col1, col2, col3, col4 = st.columns(4)
     for col, (val, label) in zip(
         [col1, col2, col3, col4],
-        [("70 000", "Images totales"), ("60 000", "Entrainement"), ("10 000", "Test"), ("10", "Classes")],
+        [(f"{len(train_ds) + len(test_ds):,}", "Images totales"),
+         (f"{len(train_ds):,}", "Entrainement"),
+         (f"{len(test_ds):,}", "Test"),
+         ("10", "Classes")],
     ):
         with col:
-            st.markdown(
-                f'<div class="kpi-card"><div class="kpi-value">{val}</div>'
-                f'<div class="kpi-label">{label}</div></div>',
-                unsafe_allow_html=True,
-            )
+            st.markdown(styled_kpi(val, label), unsafe_allow_html=True)
 
     st.markdown("<br/>", unsafe_allow_html=True)
-
     col_left, col_right = st.columns([1, 1])
 
     with col_left:
         st.markdown("### Distribution des classes (entrainement)")
-        # Approximate MNIST class counts
-        class_counts = [5923, 6742, 5958, 6131, 5842, 5421, 5918, 6265, 5851, 5949]
-        fig_dist = go.Figure(
-            go.Bar(
-                x=[str(i) for i in range(10)],
-                y=class_counts,
-                marker_color="#1d4ed8",
-                marker_line_color="#58a6ff",
-                marker_line_width=1.2,
-            )
-        )
+        class_counts = [(targets_train == i).sum() for i in range(10)]
+        fig_dist = go.Figure(go.Bar(
+            x=[str(i) for i in range(10)],
+            y=class_counts,
+            marker_color="#1d4ed8",
+            marker_line_color="#58a6ff",
+            marker_line_width=1.2,
+            text=class_counts,
+            textposition="outside",
+            textfont=dict(color="#8b949e", size=10),
+        ))
         fig_dist.update_layout(
-            xaxis_title="Classe (chiffre)",
-            yaxis_title="Nombre d'exemples",
-            plot_bgcolor="#0d1117",
-            paper_bgcolor="#161b22",
-            font=dict(color="#8b949e", family="Inter"),
-            xaxis=dict(gridcolor="#21262d"),
-            yaxis=dict(gridcolor="#21262d"),
-            margin=dict(l=10, r=10, t=20, b=10),
-            height=320,
+            xaxis_title="Classe (chiffre)", yaxis_title="Nombre d'exemples",
+            **PLOTLY_BASE,
+            xaxis=AXIS_STYLE, yaxis={**AXIS_STYLE, "range": [0, max(class_counts) * 1.12]},
+            margin=dict(l=10, r=10, t=10, b=10), height=320,
         )
-        st.plotly_chart(fig_dist, width='stretch')
+        st.plotly_chart(fig_dist,  width='stretch')
 
     with col_right:
         st.markdown("### Proprietes du dataset")
         props = {
-            "Resolution": "28 x 28 pixels",
-            "Canaux": "1 (niveaux de gris)",
-            "Plage de valeurs": "[0, 255] → normalise [0, 1]",
-            "Classe minimale": "Chiffre 5 (5421 ex.)",
-            "Classe maximale": "Chiffre 1 (6742 ex.)",
-            "Desequilibre": "< 20 % — dataset equilibre",
+            "Resolution":       "28 x 28 pixels",
+            "Canaux":           "1 (niveaux de gris)",
+            "Normalisation":    "mean=0.1307 / std=0.3081",
+            "Classe minimale":  f"Chiffre {int(np.argmin(class_counts))} ({min(class_counts):,} ex.)",
+            "Classe maximale":  f"Chiffre {int(np.argmax(class_counts))} ({max(class_counts):,} ex.)",
+            "Desequilibre":     f"{(max(class_counts)-min(class_counts))/max(class_counts)*100:.1f} %",
         }
         for k, v in props.items():
             st.markdown(
-                f'<div style="display:flex; justify-content:space-between; padding:0.5rem 0; '
+                f'<div style="display:flex;justify-content:space-between;padding:0.5rem 0;'
                 f'border-bottom:1px solid #21262d;">'
-                f'<span style="color:#8b949e; font-size:0.88rem;">{k}</span>'
-                f'<span style="color:#e6edf3; font-family:JetBrains Mono,monospace; font-size:0.85rem;">{v}</span>'
+                f'<span style="color:#8b949e;font-size:0.88rem;">{k}</span>'
+                f'<span style="color:#e6edf3;font-family:JetBrains Mono,monospace;font-size:0.85rem;">{v}</span>'
                 f"</div>",
                 unsafe_allow_html=True,
             )
 
+    # Galerie reelle
     st.markdown("<br/>", unsafe_allow_html=True)
-    st.markdown("### Galerie d'exemples")
+    st.markdown("### Galerie d'exemples (images reelles MNIST)")
 
-    if st.button("Generer une galerie aleatoire"):
-        st.session_state.gallery_seed = random.randint(0, 9999)
+    n_per_class = st.slider("Exemples par classe", 1, 5, 2)
 
-    seed = getattr(st.session_state, "gallery_seed", 42)
-    rng = np.random.default_rng(seed)
-
-    fig_gallery = make_subplots(rows=2, cols=10, horizontal_spacing=0.01, vertical_spacing=0.04)
-
+    fig_gallery = make_subplots(
+        rows=n_per_class, cols=10,
+        horizontal_spacing=0.008, vertical_spacing=0.04,
+    )
     for digit in range(10):
-        for row in range(2):
-            # Synthetic MNIST-like noise image for demonstration
-            img = rng.uniform(0, 0.15, (28, 28))
-            # Draw a rough digit shape in the center
-            cx, cy = 14 + rng.integers(-2, 3), 14 + rng.integers(-2, 3)
-            for px in range(28):
-                for py in range(28):
-                    if abs(px - cx) + abs(py - cy) < 7:
-                        img[px, py] += rng.uniform(0.5, 0.9)
-            img = np.clip(img, 0, 1)
-
+        idxs = np.where(targets_train == digit)[0][:n_per_class]
+        for row_idx, sample_idx in enumerate(idxs):
+            img_np = train_ds[int(sample_idx)][0].squeeze().numpy()
             fig_gallery.add_trace(
-                go.Heatmap(
-                    z=img,
-                    colorscale="gray",
-                    showscale=False,
-                    zmin=0, zmax=1,
-                ),
-                row=row + 1,
-                col=digit + 1,
+                go.Heatmap(z=img_np, colorscale="gray", showscale=False, zmin=0, zmax=1),
+                row=row_idx + 1, col=digit + 1,
             )
-            if row == 0:
+            if row_idx == 0:
                 fig_gallery.update_xaxes(
                     title_text=str(digit),
                     title_font=dict(color="#58a6ff", size=10),
-                    showticklabels=False,
-                    row=row + 1, col=digit + 1,
+                    showticklabels=False, row=1, col=digit + 1,
                 )
             else:
-                fig_gallery.update_xaxes(showticklabels=False, row=row + 1, col=digit + 1)
-            fig_gallery.update_yaxes(showticklabels=False, row=row + 1, col=digit + 1)
+                fig_gallery.update_xaxes(showticklabels=False, row=row_idx + 1, col=digit + 1)
+            fig_gallery.update_yaxes(showticklabels=False, row=row_idx + 1, col=digit + 1)
 
     fig_gallery.update_layout(
-        plot_bgcolor="#0d1117",
-        paper_bgcolor="#161b22",
+        **PLOTLY_BASE,
         margin=dict(l=5, r=5, t=10, b=5),
-        height=200,
+        height=120 * n_per_class,
     )
-    st.plotly_chart(fig_gallery, width='stretch')
-    st.markdown(
-        '<div class="info-box">La galerie ci-dessus est generative — elle simule la distribution MNIST. '
-        "Connectez utils.py pour afficher les vraies images du dataset.</div>",
-        unsafe_allow_html=True,
-    )
+    st.plotly_chart(fig_gallery,  width='stretch')
 
 
 # ===========================================================================
@@ -547,53 +534,42 @@ elif page == "Architecture CapsNet":
     st.markdown('<div class="section-title">Architecture CapsNet</div>', unsafe_allow_html=True)
     st.markdown(
         '<div class="section-sub">'
-        "Description complete des couches du reseau a capsules tel qu'implementé dans model.py, "
+        "Description complete des couches du reseau a capsules tel qu'implemente dans model.py, "
         "conformement a l'architecture originale de Sabour et al. (2017)."
         "</div>",
         unsafe_allow_html=True,
     )
 
     layers = [
-        {
-            "name": "Couche d'entree",
-            "code": "Input(1, 28, 28)",
-            "desc": "Image MNIST en niveaux de gris, 28x28 pixels, un canal. Valeurs normalisees dans [0, 1].",
-        },
-        {
-            "name": "Convolution",
-            "code": "Conv2d(1, 256, kernel=9, stride=1) → ReLU",
-            "desc": "256 filtres de taille 9x9. Sortie : (256, 20, 20). Extraction des caracteristiques locales de bas niveau.",
-        },
-        {
-            "name": "PrimaryCaps",
-            "code": "32 capsules x 8 dim → (1152, 8)",
-            "desc": "32 groupes de 8 maps de convolution (stride=2). Chaque position spatiale produit un vecteur-capsule de dimension 8. Sortie aplatie : 1152 capsules primaires. Activation : squash.",
-        },
-        {
-            "name": "DigitCaps",
-            "code": "10 capsules x 16 dim  [routing=3]",
-            "desc": "Une capsule de 16 dimensions par classe. Matrice de poids W_ij de taille (1152, 10, 16, 8). Routage dynamique sur 3 iterations. L'activation de la capsule i encode la probabilite de presence de la classe i.",
-        },
-        {
-            "name": "Classification",
-            "code": "norm(v_j) → softmax → argmax",
-            "desc": "La norme du vecteur de chaque capsule digit est interpretee comme la probabilite d'existence de la classe. La classe predite est celle dont la capsule a la plus grande norme.",
-        },
-        {
-            "name": "Decoder (reconstruction)",
-            "code": "FC(16→512) → FC(512→1024) → FC(1024→784) → Sigmoid",
-            "desc": "Trois couches lineaires reconstruisant l'image d'entree a partir du vecteur de la capsule de la vraie classe (ou de la classe predite). Perte additionnelle : MSE(reconstruction, image).",
-        },
+        {"name": "Entree",
+         "code": "Input(1, 28, 28)",
+         "desc": "Image MNIST en niveaux de gris, 28x28 pixels. Normalisation : mean=0.1307, std=0.3081."},
+        {"name": "Conv2d",
+         "code": "Conv2d(1→256, kernel=9, stride=1) → ReLU → (256, 20, 20)",
+         "desc": "256 filtres 9x9 extraient les caracteristiques locales de bas niveau."},
+        {"name": "PrimaryCaps",
+         "code": "Conv2d(256→256, kernel=9, stride=2) → reshape → squash → (1152, 8)",
+         "desc": "32 groupes de capsules, chacun produisant un vecteur de dimension 8. "
+                 "Sortie aplatie : 1152 capsules primaires. Activation : squash."},
+        {"name": "DigitCaps",
+         "code": "W(1152, 10, 16, 8) · u → routing(3 iter.) → (10, 16)",
+         "desc": "10 capsules de dimension 16, une par classe. Routage dynamique sur 3 iterations. "
+                 "La norme du vecteur encode la probabilite d'existence de la classe."},
+        {"name": "Classification",
+         "code": "||v_j|| → argmax → classe predite",
+         "desc": "La capsule ayant la plus grande norme determine la classe predite."},
+        {"name": "Decoder",
+         "code": "FC(160→512) → ReLU → FC(512→1024) → ReLU → FC(1024→784) → Sigmoid → (1,28,28)",
+         "desc": "Reconstruction de l'image a partir du vecteur de la capsule active "
+                 "(vraie classe a l'entrainement, classe predite en inference). Perte MSE ponderee par 0.0005."},
     ]
 
     for layer in layers:
         st.markdown(
-            f'<div class="arch-block">'
-            f'<h4>{layer["name"]}</h4>'
-            f'<div style="font-family:JetBrains Mono,monospace; font-size:0.8rem; color:#3fb950; '
+            f'<div class="arch-block"><h4>{layer["name"]}</h4>'
+            f'<div style="font-family:JetBrains Mono,monospace;font-size:0.8rem;color:#3fb950;'
             f'margin-bottom:0.5rem;">{layer["code"]}</div>'
-            f'<p>{layer["desc"]}</p>'
-            f"</div>",
+            f'<p>{layer["desc"]}</p></div>',
             unsafe_allow_html=True,
         )
 
@@ -601,69 +577,50 @@ elif page == "Architecture CapsNet":
     col_left, col_right = st.columns(2)
 
     with col_left:
-        st.markdown("### Fonction d'activation : Squash")
+        st.markdown("### Fonction Squash")
         st.markdown(
             r"""
-La fonction **squash** compresse la norme d'un vecteur capsule dans [0, 1] tout en preservant sa direction :
+$$\mathbf{v}_j = \frac{\|\mathbf{s}_j\|^2}{1+\|\mathbf{s}_j\|^2} \cdot \frac{\mathbf{s}_j}{\|\mathbf{s}_j\|}$$
 
-$$\mathbf{v}_j = \frac{\|\mathbf{s}_j\|^2}{1 + \|\mathbf{s}_j\|^2} \cdot \frac{\mathbf{s}_j}{\|\mathbf{s}_j\|}$$
-
-- Si $\|\mathbf{s}_j\|$ est grand → norme proche de 1 (capsule tres active)
-- Si $\|\mathbf{s}_j\|$ est petit → norme proche de 0 (capsule inactive)
+- $\|\mathbf{s}_j\|$ grand → norme proche de 1 (capsule active)
+- $\|\mathbf{s}_j\|$ petit → norme proche de 0 (capsule inactive)
 """
         )
 
     with col_right:
-        st.markdown("### Fonction de perte (Margin Loss)")
+        st.markdown("### Margin Loss")
         st.markdown(
             r"""
-Pour chaque capsule de classe $k$, la **margin loss** penalise les faux positifs et faux negatifs :
+$$L_k = T_k\max(0,\,m^+-\|\mathbf{v}_k\|)^2 + \lambda(1-T_k)\max(0,\|\mathbf{v}_k\|-m^-)^2$$
 
-$$L_k = T_k \max(0, m^+ - \|\mathbf{v}_k\|)^2 + \lambda(1 - T_k)\max(0, \|\mathbf{v}_k\| - m^-)^2$$
-
-Avec $m^+ = 0.9$, $m^- = 0.1$, $\lambda = 0.5$.
-
-La perte totale inclut un terme MSE pour la reconstruction, pondere par 0.0005.
+$m^+=0.9$, $m^-=0.1$, $\lambda=0.5$.
+Perte totale = margin loss + 0.0005 × MSE reconstruction.
 """
         )
 
+    # Statistiques reelles du modele
     st.markdown("<br/>", unsafe_allow_html=True)
     st.markdown("### Statistiques du modele")
-
-    total_params = (
-        256 * 1 * 9 * 9 + 256  # Conv
-        + 32 * 8 * 256 * 9 * 9  # PrimaryCaps
-        + 1152 * 10 * 16 * 8  # DigitCaps W
-        + 16 * 512 + 512  # Decoder FC1
-        + 512 * 1024 + 1024  # Decoder FC2
-        + 1024 * 784 + 784  # Decoder FC3
-    )
+    _m = CapsNet()
+    n_params = count_parameters(_m)
+    mem_mb = n_params * 4 / 1e6  # FP32
 
     col1, col2, col3 = st.columns(3)
     for col, (val, label) in zip(
         [col1, col2, col3],
-        [(f"{total_params:,}", "Parametres totaux"), ("~26 MB", "Memoire (FP32)"), ("3", "Iterations routing")],
+        [(f"{n_params:,}", "Parametres entrainables"),
+         (f"{mem_mb:.1f} MB", "Memoire FP32"),
+         ("3", "Iterations routing")],
     ):
         with col:
-            st.markdown(
-                f'<div class="kpi-card"><div class="kpi-value">{val}</div>'
-                f'<div class="kpi-label">{label}</div></div>',
-                unsafe_allow_html=True,
-            )
+            st.markdown(styled_kpi(val, label), unsafe_allow_html=True)
 
-    if MODEL_AVAILABLE:
-        st.markdown("<br/>", unsafe_allow_html=True)
-        try:
-            model = CapsNet()
-            buffer = io.StringIO()
-            import sys
-            old_stdout = sys.stdout
-            sys.stdout = buffer
-            print(model)
-            sys.stdout = old_stdout
-            st.code(buffer.getvalue(), language="text")
-        except Exception as e:
-            st.warning(f"Impossible de charger le modele : {e}")
+    st.markdown("<br/>", unsafe_allow_html=True)
+    _buf = io.StringIO()
+    _old = sys.stdout; sys.stdout = _buf
+    print(_m)
+    sys.stdout = _old
+    st.code(_buf.getvalue(), language="text")
 
 
 # ===========================================================================
@@ -673,7 +630,8 @@ elif page == "Entrainement":
     st.markdown('<div class="section-title">Entrainement</div>', unsafe_allow_html=True)
     st.markdown(
         '<div class="section-sub">'
-        "Configurez les hyperparametres et lancez l'entrainement du modele CapsNet directement depuis l'interface."
+        "Configurez les hyperparametres et lancez l'entrainement. Les metriques sont mises "
+        "a jour apres chaque epoque."
         "</div>",
         unsafe_allow_html=True,
     )
@@ -682,121 +640,122 @@ elif page == "Entrainement":
 
     with col_params:
         st.markdown("### Hyperparametres")
-        batch_size = st.selectbox("Batch size", [32, 64, 128, 256], index=1)
-        lr = st.number_input("Learning rate", value=0.001, step=0.0001, format="%.4f")
-        epochs = st.slider("Nombre d'epoques", 1, 50, 10)
-        routing_iter = st.slider("Iterations du routing dynamique", 1, 5, 3)
+        batch_size    = st.selectbox("Batch size", [32, 64, 128, 256], index=2)
+        lr            = st.number_input("Learning rate", value=0.001, step=0.0001, format="%.4f")
+        epochs        = st.slider("Nombre d'epoques", 1, 50, 10)
+        routing_iter  = st.slider("Iterations routing dynamique", 1, 5, 3)
         optimizer_name = st.selectbox("Optimiseur", ["Adam", "SGD"])
-        reconstruction_weight = st.number_input(
-            "Poids reconstruction (lambda)", value=0.0005, step=0.0001, format="%.4f"
-        )
+        seed          = st.number_input("Seed", value=42, step=1)
 
     with col_run:
-        st.markdown("### Lancement de l'entrainement")
-
-        if not TRAIN_AVAILABLE or not UTILS_AVAILABLE:
-            st.markdown(
-                '<div class="info-box">Les modules <b>train.py</b> et <b>utils.py</b> doivent etre presents '
-                "dans le repertoire du projet pour lancer un entrainement reel.</div>",
-                unsafe_allow_html=True,
-            )
-
-        run_demo = st.checkbox("Mode demonstration (donnees simulees, sans GPU requis)", value=True)
-        start = st.button("Lancer l'entrainement", width='stretch')
+        st.markdown("### Lancement")
+        start = st.button("Lancer l'entrainement",  width='stretch')
 
         if start:
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            chart_placeholder = st.empty()
+            set_seed(int(seed))
+            train_loader, test_loader = get_dataloaders(batch_size)
+            st.session_state.train_loader = train_loader
+            st.session_state.test_loader  = test_loader
 
-            train_losses, val_losses, train_accs, val_accs = [], [], [], []
+            model = CapsNet(num_routing=routing_iter).to(DEVICE)
+            criterion = CapsLoss()
+
+            if optimizer_name == "Adam":
+                optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+            else:
+                optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9)
+
+            progress_bar    = st.progress(0)
+            status_text     = st.empty()
+            chart_ph        = st.empty()
+
+            train_losses, val_accs = [], []
 
             for epoch in range(1, epochs + 1):
                 t0 = time.time()
 
-                if run_demo or not (TRAIN_AVAILABLE and UTILS_AVAILABLE):
-                    # Simulated curves
-                    decay = 1 - epoch / (epochs + 2)
-                    tl = 0.45 * decay + random.uniform(-0.02, 0.02)
-                    vl = 0.50 * decay + random.uniform(-0.02, 0.02)
-                    ta = 1 - 0.85 * decay + random.uniform(-0.01, 0.01)
-                    va = 1 - 0.88 * decay + random.uniform(-0.01, 0.01)
-                else:
-                    try:
-                        train_loader, test_loader = load_data(batch_size=batch_size)
-                        device_t = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-                        model = CapsNet().to(device_t)
-                        if optimizer_name == "Adam":
-                            opt = torch.optim.Adam(model.parameters(), lr=lr)
-                        else:
-                            opt = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9)
-                        tl, ta = train_model(model, train_loader, opt, device_t)
-                        vl, va = evaluate_model(model, test_loader, device_t)
-                        st.session_state.model = model
-                    except Exception as e:
-                        st.error(f"Erreur durant l'entrainement : {e}")
-                        break
+                # --- Entrainement sur une epoque ---
+                model.train()
+                epoch_loss = 0.0
+                n_batches  = 0
+                for data, target in train_loader:
+                    data, target = data.to(DEVICE), target.to(DEVICE)
+                    target_ohe = torch.eye(10, device=DEVICE)[target]
+                    optimizer.zero_grad()
+                    _, classes, reconstructions = model(data, target_ohe)
+                    loss = criterion(data, target_ohe, classes, reconstructions)
+                    loss.backward()
+                    optimizer.step()
+                    epoch_loss += loss.item()
+                    n_batches  += 1
+                avg_loss = epoch_loss / n_batches
 
-                train_losses.append(max(0.0, tl))
-                val_losses.append(max(0.0, vl))
-                train_accs.append(min(1.0, ta))
-                val_accs.append(min(1.0, va))
+                # --- Evaluation rapide ---
+                acc = test(model, test_loader, criterion, DEVICE)
+
+                train_losses.append(avg_loss)
+                val_accs.append(acc)
 
                 elapsed = time.time() - t0
-                eta = elapsed * (epochs - epoch)
+                eta     = elapsed * (epochs - epoch)
 
                 progress_bar.progress(epoch / epochs)
                 status_text.markdown(
-                    f'<div style="font-family:JetBrains Mono,monospace; font-size:0.85rem; color:#8b949e;">'
+                    f'<div style="font-family:JetBrains Mono,monospace;font-size:0.85rem;color:#8b949e;">'
                     f"Epoque {epoch}/{epochs} &nbsp;|&nbsp; "
-                    f"Train loss: <span style='color:#58a6ff'>{train_losses[-1]:.4f}</span> &nbsp;|&nbsp; "
-                    f"Val acc: <span style='color:#3fb950'>{val_accs[-1]*100:.2f}%</span> &nbsp;|&nbsp; "
-                    f"ETA: <span style='color:#d29922'>{eta:.0f}s</span>"
+                    f"Loss : <span style='color:#58a6ff'>{avg_loss:.4f}</span> &nbsp;|&nbsp; "
+                    f"Accuracy : <span style='color:#3fb950'>{acc:.2f}%</span> &nbsp;|&nbsp; "
+                    f"ETA : <span style='color:#d29922'>{eta:.0f}s</span>"
                     f"</div>",
                     unsafe_allow_html=True,
                 )
 
-                # Live chart update
-                fig_live = make_subplots(rows=1, cols=2, subplot_titles=["Loss", "Accuracy"])
                 epochs_range = list(range(1, epoch + 1))
+                fig_live = make_subplots(rows=1, cols=2, subplot_titles=["Loss (train)", "Accuracy % (test)"])
                 fig_live.add_trace(
-                    go.Scatter(x=epochs_range, y=train_losses, name="Train", line=dict(color="#58a6ff")),
-                    row=1, col=1,
-                )
+                    go.Scatter(x=epochs_range, y=train_losses, name="Loss",
+                               line=dict(color="#58a6ff")), row=1, col=1)
                 fig_live.add_trace(
-                    go.Scatter(x=epochs_range, y=val_losses, name="Val", line=dict(color="#f85149")),
-                    row=1, col=1,
-                )
-                fig_live.add_trace(
-                    go.Scatter(x=epochs_range, y=[a * 100 for a in train_accs], name="Train", line=dict(color="#58a6ff"), showlegend=False),
-                    row=1, col=2,
-                )
-                fig_live.add_trace(
-                    go.Scatter(x=epochs_range, y=[a * 100 for a in val_accs], name="Val", line=dict(color="#3fb950"), showlegend=False),
-                    row=1, col=2,
-                )
+                    go.Scatter(x=epochs_range, y=val_accs, name="Accuracy",
+                               line=dict(color="#3fb950"), showlegend=False), row=1, col=2)
                 fig_live.update_layout(
-                    plot_bgcolor="#0d1117",
-                    paper_bgcolor="#161b22",
-                    font=dict(color="#8b949e"),
-                    margin=dict(l=10, r=10, t=40, b=10),
-                    height=320,
+                    **PLOTLY_BASE,
+                    margin=dict(l=10, r=10, t=40, b=10), height=300,
                     legend=dict(bgcolor="#161b22", bordercolor="#21262d"),
                 )
                 for r, c in [(1, 1), (1, 2)]:
                     fig_live.update_xaxes(gridcolor="#21262d", row=r, col=c)
                     fig_live.update_yaxes(gridcolor="#21262d", row=r, col=c)
+                chart_ph.plotly_chart(fig_live,  width='stretch')
 
-                chart_placeholder.plotly_chart(fig_live, width='stretch')
-                time.sleep(0.05)
-
+            # Sauvegarde
+            st.session_state.model = model
             st.session_state.training_history = {
                 "train_losses": train_losses,
-                "val_losses": val_losses,
-                "train_accs": train_accs,
-                "val_accs": val_accs,
+                "val_accs":     val_accs,
             }
-            st.success(f"Entrainement termine — meilleure accuracy : {max(val_accs)*100:.2f} %")
+            st.session_state.eval_data = None   # invalider le cache d'eval
+
+            torch.save(model.state_dict(), "capsnet_best.pth")
+            st.success(
+                f"Entrainement termine — meilleure accuracy : {max(val_accs):.2f}% "
+                f"— modele sauvegarde dans capsnet_best.pth"
+            )
+
+    # Charger un checkpoint existant
+    st.markdown("<hr/>", unsafe_allow_html=True)
+    st.markdown("### Charger un checkpoint")
+    ckpt_path = st.text_input("Chemin vers un fichier .pth", value="capsnet_best.pth")
+    ckpt_routing = st.number_input("Iterations routing du checkpoint", value=3, step=1)
+    if st.button("Charger le modele"):
+        try:
+            m = CapsNet(num_routing=int(ckpt_routing)).to(DEVICE)
+            m.load_state_dict(torch.load(ckpt_path, map_location=DEVICE))
+            st.session_state.model = m
+            st.session_state.eval_data = None
+            st.success(f"Modele charge depuis {ckpt_path}")
+        except Exception as e:
+            st.error(f"Echec du chargement : {e}")
 
 
 # ===========================================================================
@@ -804,131 +763,109 @@ elif page == "Entrainement":
 # ===========================================================================
 elif page == "Evaluation":
     st.markdown('<div class="section-title">Evaluation du modele</div>', unsafe_allow_html=True)
-    st.markdown(
-        '<div class="section-sub">'
-        "Metriques de performance, matrice de confusion et courbes d'apprentissage."
-        "</div>",
-        unsafe_allow_html=True,
-    )
 
-    # Generate or load results
-    if st.session_state.training_history is not None:
-        history = st.session_state.training_history
-        final_acc = max(history["val_accs"])
-    else:
-        final_acc = 0.9927
-        history = None
+    if st.session_state.model is None:
+        st.warning("Aucun modele en memoire. Lancez un entrainement ou chargez un checkpoint.")
+        st.stop()
 
-    # Simulate evaluation metrics
-    accuracy = final_acc
-    precision = accuracy - random.uniform(0.001, 0.003)
-    recall = accuracy - random.uniform(0.001, 0.003)
-    f1 = 2 * precision * recall / (precision + recall)
+    model = st.session_state.model
+
+    # Chargement du test loader si absent
+    if st.session_state.test_loader is None:
+        _, test_loader = get_dataloaders(128)
+        st.session_state.test_loader = test_loader
+    test_loader = st.session_state.test_loader
+
+    # Inference (avec cache dans session_state)
+    if st.session_state.eval_data is None:
+        with st.spinner("Calcul des predictions sur le test set…"):
+            st.session_state.eval_data = run_full_eval(model, test_loader, DEVICE, n_batches=80)
+
+    ed = st.session_state.eval_data
+    y_true, y_pred = ed["y_true"], ed["y_pred"]
+
+    accuracy  = (y_true == y_pred).mean() * 100
+    report    = classification_report(y_true, y_pred, output_dict=True, zero_division=0)
+    precision = report["weighted avg"]["precision"] * 100
+    recall    = report["weighted avg"]["recall"] * 100
+    f1        = report["weighted avg"]["f1-score"] * 100
 
     col1, col2, col3, col4 = st.columns(4)
     for col, (name, val) in zip(
         [col1, col2, col3, col4],
-        [("Accuracy", accuracy), ("Precision", precision), ("Recall", recall), ("F1-Score", f1)],
+        [("Accuracy", accuracy), ("Precision", precision),
+         ("Recall", recall), ("F1-Score", f1)],
     ):
         with col:
-            st.markdown(
-                f'<div class="kpi-card">'
-                f'<div class="kpi-value">{val*100:.2f}%</div>'
-                f'<div class="kpi-label">{name}</div>'
-                f"</div>",
-                unsafe_allow_html=True,
-            )
+            st.markdown(styled_kpi(f"{val:.2f}%", name), unsafe_allow_html=True)
 
     st.markdown("<br/>", unsafe_allow_html=True)
     col_left, col_right = st.columns(2)
 
     with col_left:
         st.markdown("### Matrice de confusion")
-        rng = np.random.default_rng(42)
-        n_samples = 1000
-        y_true = rng.integers(0, 10, n_samples)
-        # Add noise to simulate near-perfect predictions
-        y_pred = y_true.copy()
-        error_idx = rng.choice(n_samples, size=int(n_samples * (1 - accuracy)), replace=False)
-        y_pred[error_idx] = rng.integers(0, 10, len(error_idx))
-
         cm = confusion_matrix(y_true, y_pred)
         fig_cm = px.imshow(
-            cm,
-            color_continuous_scale="Blues",
-            text_auto=True,
+            cm, color_continuous_scale="Blues", text_auto=True,
             labels=dict(x="Classe predite", y="Classe reelle"),
-            x=[str(i) for i in range(10)],
-            y=[str(i) for i in range(10)],
+            x=[str(i) for i in range(10)], y=[str(i) for i in range(10)],
         )
         fig_cm.update_layout(
-            plot_bgcolor="#0d1117",
-            paper_bgcolor="#161b22",
-            font=dict(color="#8b949e", family="Inter"),
-            coloraxis_showscale=False,
-            margin=dict(l=10, r=10, t=10, b=10),
-            height=380,
+            **PLOTLY_BASE, coloraxis_showscale=False,
+            margin=dict(l=10, r=10, t=10, b=10), height=400,
         )
-        st.plotly_chart(fig_cm, width='stretch')
+        st.plotly_chart(fig_cm,  width='stretch')
 
     with col_right:
         st.markdown("### Rapport de classification")
-        report = classification_report(y_true, y_pred, output_dict=True)
-        rows = []
+        header = ["Classe", "Precision", "Recall", "F1", "Support"]
+        rows_html = ""
         for digit in range(10):
             r = report[str(digit)]
-            rows.append({
-                "Classe": str(digit),
-                "Precision": f"{r['precision']*100:.1f}%",
-                "Recall": f"{r['recall']*100:.1f}%",
-                "F1": f"{r['f1-score']*100:.1f}%",
-                "Support": int(r["support"]),
-            })
-
-        # Render as styled table
-        header = ["Classe", "Precision", "Recall", "F1", "Support"]
-        table_html = '<table style="width:100%;border-collapse:collapse;font-size:0.85rem;">'
-        table_html += "<thead><tr>" + "".join(
-            f'<th style="padding:0.4rem 0.6rem;color:#58a6ff;border-bottom:1px solid #21262d;text-align:left;">{h}</th>'
-            for h in header
-        ) + "</tr></thead><tbody>"
-        for row in rows:
-            table_html += "<tr>" + "".join(
-                f'<td style="padding:0.4rem 0.6rem;color:#c9d1d9;border-bottom:1px solid #21262d;font-family:JetBrains Mono,monospace;">{row[h]}</td>'
-                for h in header
+            rows_html += "<tr>" + "".join(
+                f'<td style="padding:0.4rem 0.6rem;color:#c9d1d9;border-bottom:1px solid #21262d;'
+                f'font-family:JetBrains Mono,monospace;">{v}</td>'
+                for v in [
+                    str(digit),
+                    f"{r['precision']*100:.1f}%",
+                    f"{r['recall']*100:.1f}%",
+                    f"{r['f1-score']*100:.1f}%",
+                    int(r["support"]),
+                ]
             ) + "</tr>"
-        table_html += "</tbody></table>"
+
+        table_html = (
+            '<table style="width:100%;border-collapse:collapse;font-size:0.85rem;">'
+            "<thead><tr>"
+            + "".join(
+                f'<th style="padding:0.4rem 0.6rem;color:#58a6ff;border-bottom:1px solid '
+                f'#21262d;text-align:left;">{h}</th>'
+                for h in header
+            )
+            + f"</tr></thead><tbody>{rows_html}</tbody></table>"
+        )
         st.markdown(table_html, unsafe_allow_html=True)
 
+    # Courbes d'apprentissage si disponibles
+    history = st.session_state.training_history
     if history:
         st.markdown("<br/>", unsafe_allow_html=True)
         st.markdown("### Courbes d'apprentissage")
-        epochs_range = list(range(1, len(history["train_losses"]) + 1))
-        fig_curves = make_subplots(rows=1, cols=2, subplot_titles=["Evolution de la Loss", "Evolution de l'Accuracy"])
+        ep_range = list(range(1, len(history["train_losses"]) + 1))
+        fig_curves = make_subplots(rows=1, cols=2, subplot_titles=["Loss (train)", "Accuracy % (test)"])
         fig_curves.add_trace(
-            go.Scatter(x=epochs_range, y=history["train_losses"], name="Train loss", line=dict(color="#58a6ff")),
-            row=1, col=1,
-        )
+            go.Scatter(x=ep_range, y=history["train_losses"], name="Loss",
+                       line=dict(color="#58a6ff")), row=1, col=1)
         fig_curves.add_trace(
-            go.Scatter(x=epochs_range, y=history["val_losses"], name="Val loss", line=dict(color="#f85149")),
-            row=1, col=1,
-        )
-        fig_curves.add_trace(
-            go.Scatter(x=epochs_range, y=[a * 100 for a in history["train_accs"]], name="Train acc", line=dict(color="#58a6ff"), showlegend=False),
-            row=1, col=2,
-        )
-        fig_curves.add_trace(
-            go.Scatter(x=epochs_range, y=[a * 100 for a in history["val_accs"]], name="Val acc", line=dict(color="#3fb950"), showlegend=False),
-            row=1, col=2,
-        )
+            go.Scatter(x=ep_range, y=history["val_accs"], name="Accuracy",
+                       line=dict(color="#3fb950"), showlegend=False), row=1, col=2)
         fig_curves.update_layout(
-            plot_bgcolor="#0d1117", paper_bgcolor="#161b22",
-            font=dict(color="#8b949e"), margin=dict(l=10, r=10, t=40, b=10), height=320,
+            **PLOTLY_BASE, margin=dict(l=10, r=10, t=40, b=10), height=300,
         )
         for r, c in [(1, 1), (1, 2)]:
             fig_curves.update_xaxes(gridcolor="#21262d", row=r, col=c)
             fig_curves.update_yaxes(gridcolor="#21262d", row=r, col=c)
-        st.plotly_chart(fig_curves, width='stretch')
+        st.plotly_chart(fig_curves,  width='stretch')
 
 
 # ===========================================================================
@@ -938,11 +875,17 @@ elif page == "Predictions":
     st.markdown('<div class="section-title">Predictions</div>', unsafe_allow_html=True)
     st.markdown(
         '<div class="section-sub">'
-        "Deposez une image de chiffre manuscrit. Le modele pretraite automatiquement l'image "
-        "et retourne la classe predite ainsi que les probabilites pour chaque digit."
+        "Deposez une image de chiffre manuscrit. Le modele applique le meme preprocessing "
+        "que lors de l'entrainement et retourne la classe predite avec les probabilites."
         "</div>",
         unsafe_allow_html=True,
     )
+
+    if st.session_state.model is None:
+        st.warning("Aucun modele en memoire. Lancez un entrainement ou chargez un checkpoint.")
+        st.stop()
+
+    model = st.session_state.model.eval()
 
     col_upload, col_result = st.columns([1, 1.4])
 
@@ -950,95 +893,70 @@ elif page == "Predictions":
         uploaded_file = st.file_uploader("Charger une image (PNG ou JPG)", type=["png", "jpg", "jpeg"])
 
         if uploaded_file is not None:
-            img = Image.open(uploaded_file).convert("L")
-            st.image(img, caption="Image originale", use_column_width=True)
+            img_pil = Image.open(uploaded_file).convert("L")
+            st.image(img_pil, caption="Image originale", use_column_width=True)
 
-            # Preprocess
+            # Preprocessing identique a l'entrainement
             transform = transforms.Compose([
                 transforms.Resize((28, 28)),
                 transforms.ToTensor(),
+                transforms.Normalize((0.1307,), (0.3081,)),
             ])
-            img_tensor = transform(img).unsqueeze(0)  # (1, 1, 28, 28)
+            img_tensor = transform(img_pil).unsqueeze(0).to(DEVICE)
 
-            st.markdown("**Image preprocessee (28x28, grayscale)**")
-            img_28 = np.array(img.resize((28, 28), Image.LANCZOS)) / 255.0
-            fig_pre = px.imshow(img_28, color_continuous_scale="gray", zmin=0, zmax=1)
-            fig_pre.update_layout(
-                margin=dict(l=0, r=0, t=0, b=0),
-                height=200,
-                paper_bgcolor="#161b22",
-                coloraxis_showscale=False,
-            )
-            fig_pre.update_xaxes(visible=False)
-            fig_pre.update_yaxes(visible=False)
-            st.plotly_chart(fig_pre, width='stretch')
+            # Affichage de l'image preprocessee (denormalisee pour la visu)
+            img_vis = img_tensor.squeeze().cpu().numpy()
+            img_vis = (img_vis - img_vis.min()) / (img_vis.max() - img_vis.min() + 1e-8)
+            st.markdown("**Image preprocessee 28x28**")
+            fig_pre = plotly_heatmap_img(img_vis)
+            st.plotly_chart(fig_pre,  width='stretch')
 
     with col_result:
         if uploaded_file is not None:
-            # Run inference
-            rng = np.random.default_rng(int(uploaded_file.size) % 1000)
-            if MODEL_AVAILABLE and st.session_state.model is not None:
-                try:
-                    model = st.session_state.model.eval()
-                    with torch.no_grad():
-                        output = model(img_tensor)
-                        probs = output.norm(dim=-1).squeeze().numpy()
-                        probs = probs / probs.sum()
-                        pred_class = int(np.argmax(probs))
-                        confidence = float(probs[pred_class])
-                except Exception as e:
-                    st.warning(f"Inference impossible : {e}")
-                    probs = rng.dirichlet(np.ones(10) * 0.3)
-                    pred_class = int(np.argmax(probs))
-                    confidence = float(probs[pred_class])
-            else:
-                probs = rng.dirichlet(np.ones(10) * 0.3)
-                pred_class = int(np.argmax(probs))
-                confidence = float(probs[pred_class])
+            with torch.no_grad():
+                v, classes, _ = model(img_tensor)
+                probs = classes.squeeze().cpu().numpy()
+                pred_class  = int(probs.argmax())
+                confidence  = float(probs[pred_class])
 
-            st.markdown(
-                f'<div class="kpi-card" style="margin-bottom:1rem;">'
-                f'<div class="kpi-value">{pred_class}</div>'
-                f'<div class="kpi-label">Classe predite</div>'
-                f"</div>",
-                unsafe_allow_html=True,
-            )
-            st.markdown(
-                f'<div class="kpi-card" style="margin-bottom:1.5rem;">'
-                f'<div class="kpi-value">{confidence*100:.1f}%</div>'
-                f'<div class="kpi-label">Confiance</div>'
-                f"</div>",
-                unsafe_allow_html=True,
-            )
+            st.markdown(styled_kpi(str(pred_class), "Classe predite", "margin-bottom:1rem;"),
+                        unsafe_allow_html=True)
+            st.markdown(styled_kpi(f"{confidence*100:.1f}%", "Confiance (norme capsule)",
+                                   "margin-bottom:1.5rem;"),
+                        unsafe_allow_html=True)
 
-            st.markdown("### Probabilites par classe")
-            fig_probs = go.Figure(
-                go.Bar(
-                    x=[str(i) for i in range(10)],
-                    y=[p * 100 for p in probs],
-                    marker_color=["#1d4ed8" if i != pred_class else "#3fb950" for i in range(10)],
-                    marker_line_color="#21262d",
-                    marker_line_width=1,
-                    text=[f"{p*100:.1f}%" for p in probs],
-                    textposition="outside",
-                    textfont=dict(color="#8b949e", size=10),
-                )
-            )
+            st.markdown("### Normes des capsules digit")
+            fig_probs = go.Figure(go.Bar(
+                x=[str(i) for i in range(10)],
+                y=probs.tolist(),
+                marker_color=["#1d4ed8" if i != pred_class else "#3fb950" for i in range(10)],
+                marker_line_color="#21262d", marker_line_width=1,
+                text=[f"{p:.3f}" for p in probs],
+                textposition="outside",
+                textfont=dict(color="#8b949e", size=10),
+            ))
             fig_probs.update_layout(
-                xaxis_title="Classe",
-                yaxis_title="Probabilite (%)",
-                plot_bgcolor="#0d1117",
-                paper_bgcolor="#161b22",
-                font=dict(color="#8b949e"),
-                xaxis=dict(gridcolor="#21262d"),
-                yaxis=dict(gridcolor="#21262d", range=[0, 110]),
-                margin=dict(l=10, r=10, t=10, b=10),
-                height=280,
+                xaxis_title="Classe", yaxis_title="Norme du vecteur capsule",
+                **PLOTLY_BASE,
+                xaxis=AXIS_STYLE,
+                yaxis={**AXIS_STYLE, "range": [0, max(probs) * 1.18]},
+                margin=dict(l=10, r=10, t=10, b=10), height=280,
             )
-            st.plotly_chart(fig_probs, width='stretch')
+            st.plotly_chart(fig_probs,  width='stretch')
+
+            # Reconstruction de l'image predite
+            st.markdown("### Image reconstruite par le decodeur")
+            with torch.no_grad():
+                v_full, _, reconstructions = model(img_tensor)
+            recon_np = reconstructions.squeeze().cpu().numpy()
+            recon_np = (recon_np - recon_np.min()) / (recon_np.max() - recon_np.min() + 1e-8)
+            fig_rec = plotly_heatmap_img(recon_np)
+            st.plotly_chart(fig_rec,  width='stretch')
+
         else:
             st.markdown(
-                '<div class="info-box">Deposez une image PNG ou JPG d\'un chiffre manuscrit pour obtenir une prediction.</div>',
+                '<div class="info-box">Deposez une image PNG ou JPG d\'un chiffre manuscrit '
+                "pour obtenir une prediction.</div>",
                 unsafe_allow_html=True,
             )
 
@@ -1050,118 +968,146 @@ elif page == "Reconstruction":
     st.markdown('<div class="section-title">Reconstruction par le decodeur</div>', unsafe_allow_html=True)
     st.markdown(
         '<div class="section-sub">'
-        "L'une des proprietes distinctives de CapsNet est sa capacite a reconstruire l'image d'entree "
-        "a partir du vecteur de la capsule active. Modifier les dimensions individuelles du vecteur "
-        "permet d'observer les proprietes encodees dans chaque dimension."
+        "Exploration de la capacite de reconstruction de CapsNet. Modifiez les valeurs "
+        "du vecteur capsule pour observer l'effet sur l'image reconstruite."
         "</div>",
         unsafe_allow_html=True,
     )
+
+    if st.session_state.model is None:
+        st.warning("Aucun modele en memoire. Lancez un entrainement ou chargez un checkpoint.")
+        st.stop()
+
+    model = st.session_state.model.eval()
+
+    # Chargement d'un batch de test reel
+    if st.session_state.test_loader is None:
+        _, test_loader = get_dataloaders(128)
+        st.session_state.test_loader = test_loader
+
+    # Recuperer un exemple reel pour chaque chiffre
+    @st.cache_data(show_spinner="Preparation des exemples de test…")
+    def get_one_sample_per_class(_model_id):
+        """Renvoie un dict {digit: (image_tensor, label)} depuis le test set."""
+        tf = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.1307,), (0.3081,)),
+        ])
+        ds = datasets.MNIST(root="./data", train=False, download=True, transform=tf)
+        samples = {}
+        for img, lbl in ds:
+            if lbl not in samples:
+                samples[lbl] = img.unsqueeze(0)
+            if len(samples) == 10:
+                break
+        return samples
+
+    samples = get_one_sample_per_class(id(model))
 
     col_ctrl, col_viz = st.columns([1, 1.4])
 
     with col_ctrl:
         st.markdown("### Parametres")
-        selected_digit = st.selectbox("Chiffre de reference", list(range(10)), index=3)
-        dim_to_perturb = st.slider("Dimension capsule a modifier", 0, 15, 0)
-        perturbation = st.slider("Amplitude de la perturbation", -0.5, 0.5, 0.0, step=0.05)
+        selected_digit  = st.selectbox("Chiffre de reference (test reel)", list(range(10)), index=3)
+        dim_to_perturb  = st.slider("Dimension du vecteur capsule a modifier", 0, 15, 0)
+        perturbation    = st.slider("Amplitude de la perturbation", -0.5, 0.5, 0.0, step=0.05)
 
         st.markdown("<br/>", unsafe_allow_html=True)
         st.markdown(
             '<div class="info-box">'
-            "Chaque dimension du vecteur capsule de 16 elements encode une propriete geometrique "
-            "de l'objet (inclinaison, epaisseur du trait, largeur, etc.). Deplacer une dimension "
-            "revele ce qu'elle a appris a representer."
+            "Chaque dimension du vecteur capsule de 16 elements encode une propriete "
+            "geometrique apprise (inclinaison, epaisseur, largeur…). Deplacer une dimension "
+            "revele ce qu'elle represente."
             "</div>",
             unsafe_allow_html=True,
         )
 
     with col_viz:
-        st.markdown("### Comparaison originale / reconstruite")
+        st.markdown("### Original vs Reconstruit")
 
-        rng = np.random.default_rng(selected_digit * 10 + dim_to_perturb)
+        img_tensor = samples[selected_digit].to(DEVICE)
 
-        def make_digit_image(digit, perturb_dim=None, perturb_val=0.0, rng=None):
-            if rng is None:
-                rng = np.random.default_rng(0)
-            img = np.zeros((28, 28))
-            cx, cy = 14, 14
-            intensity = 0.85 + rng.uniform(-0.05, 0.05)
-            stroke_w = 2.2 + (perturb_val * 1.5 if perturb_dim == 1 else 0)
-            tilt = perturb_val * 3 if perturb_dim == 0 else 0
-            scale = 1.0 + (perturb_val * 0.3 if perturb_dim == 2 else 0)
-            for px_i in range(28):
-                for px_j in range(28):
-                    dx = (px_j - cx - tilt * (px_i - cy) / 14) / (6 * scale)
-                    dy = (px_i - cy) / (8 * scale)
-                    val = intensity * np.exp(-(dx ** 2 + dy ** 2) * 3) + rng.uniform(0, 0.05)
-                    img[px_i, px_j] = np.clip(val, 0, 1)
-            return img
+        with torch.no_grad():
+            v, classes, recon_orig = model(img_tensor)
+            # Vecteur capsule de la classe selectionnee
+            cap_vec = v[0, selected_digit].clone()  # (16,)
 
-        img_orig = make_digit_image(selected_digit, rng=rng)
-        img_recon = make_digit_image(
-            selected_digit, perturb_dim=dim_to_perturb, perturb_val=perturbation, rng=rng
-        )
-        error_map = np.abs(img_orig - img_recon)
-        mse = float(np.mean((img_orig - img_recon) ** 2))
+            # Perturbation d'une dimension
+            cap_vec_perturbed = cap_vec.clone()
+            cap_vec_perturbed[dim_to_perturb] += perturbation
+
+            # Reconstruire avec le vecteur perturbe
+            mask = torch.zeros(1, 10, 16, device=DEVICE)
+            mask[0, selected_digit] = cap_vec_perturbed
+            recon_perturbed = model.decoder(mask.view(1, -1))
+
+        def denorm(t):
+            a = t.squeeze().cpu().numpy()
+            return np.clip((a - a.min()) / (a.max() - a.min() + 1e-8), 0, 1)
+
+        img_orig_np   = denorm(img_tensor)
+        img_recon_np  = denorm(recon_orig)
+        img_pert_np   = denorm(recon_perturbed)
+        error_np      = np.abs(img_recon_np - img_pert_np)
+        mse_val       = float(np.mean((img_recon_np - img_pert_np) ** 2))
 
         fig_recon = make_subplots(
-            rows=1, cols=3,
-            subplot_titles=["Image originale", "Reconstruction", "Erreur |orig - recon|"],
+            rows=1, cols=4,
+            subplot_titles=["Original", "Reconstruction", "Reconstruction perturbee", "Erreur"],
         )
-        for col_idx, (img, cscale) in enumerate(
-            [(img_orig, "gray"), (img_recon, "gray"), (error_map, "Reds")], start=1
+        for col_idx, (img_np, cscale) in enumerate(
+            [(img_orig_np, "gray"), (img_recon_np, "gray"),
+             (img_pert_np, "gray"), (error_np, "Reds")], start=1
         ):
             fig_recon.add_trace(
-                go.Heatmap(z=img, colorscale=cscale, showscale=False, zmin=0, zmax=1),
+                go.Heatmap(z=img_np, colorscale=cscale, showscale=False, zmin=0, zmax=1),
                 row=1, col=col_idx,
             )
             fig_recon.update_xaxes(visible=False, row=1, col=col_idx)
             fig_recon.update_yaxes(visible=False, row=1, col=col_idx)
 
         fig_recon.update_layout(
-            plot_bgcolor="#0d1117",
-            paper_bgcolor="#161b22",
-            font=dict(color="#8b949e"),
-            margin=dict(l=5, r=5, t=40, b=5),
-            height=260,
+            **PLOTLY_BASE, margin=dict(l=5, r=5, t=40, b=5), height=240,
         )
-        st.plotly_chart(fig_recon, width='stretch')
+        st.plotly_chart(fig_recon,  width='stretch')
+        st.markdown(styled_kpi(f"{mse_val:.5f}", "MSE (recon vs perturbe)",
+                               "display:inline-block;min-width:220px;"),
+                    unsafe_allow_html=True)
 
-        st.markdown(
-            f'<div class="kpi-card" style="display:inline-block;min-width:200px;">'
-            f'<div class="kpi-value">{mse:.5f}</div>'
-            f'<div class="kpi-label">MSE reconstruction</div>'
-            f"</div>",
-            unsafe_allow_html=True,
-        )
-
+    # Traversee dimensionnelle
     st.markdown("<br/>", unsafe_allow_html=True)
     st.markdown("### Traversee dimensionnelle")
     st.markdown(
-        "Chaque colonne correspond a une valeur de perturbation differente sur la dimension selectionnee."
+        f"Perturbations de −0.5 a +0.5 sur la dimension **{dim_to_perturb}** "
+        f"du vecteur capsule du chiffre **{selected_digit}**."
     )
 
-    perturbation_values = np.linspace(-0.5, 0.5, 9)
-    fig_trav = make_subplots(rows=1, cols=9, horizontal_spacing=0.005, vertical_spacing=0.0)
+    perturb_vals = np.linspace(-0.5, 0.5, 9)
+    fig_trav = make_subplots(rows=1, cols=9, horizontal_spacing=0.006, vertical_spacing=0.0)
 
-    for col_idx, pv in enumerate(perturbation_values, start=1):
-        img_t = make_digit_image(selected_digit, perturb_dim=dim_to_perturb, perturb_val=pv, rng=rng)
-        fig_trav.add_trace(
-            go.Heatmap(z=img_t, colorscale="gray", showscale=False, zmin=0, zmax=1),
-            row=1, col=col_idx,
-        )
-        fig_trav.update_xaxes(
-            title_text=f"{pv:+.2f}", showticklabels=False,
-            title_font=dict(size=9, color="#8b949e"),
-            row=1, col=col_idx,
-        )
-        fig_trav.update_yaxes(visible=False, row=1, col=col_idx)
+    with torch.no_grad():
+        base_vec = v[0, selected_digit].clone()
+        for col_idx, pv in enumerate(perturb_vals, start=1):
+            cv = base_vec.clone()
+            cv[dim_to_perturb] += float(pv)
+            mask_t = torch.zeros(1, 10, 16, device=DEVICE)
+            mask_t[0, selected_digit] = cv
+            recon_t = model.decoder(mask_t.view(1, -1))
+            img_t   = denorm(recon_t)
+            fig_trav.add_trace(
+                go.Heatmap(z=img_t, colorscale="gray", showscale=False, zmin=0, zmax=1),
+                row=1, col=col_idx,
+            )
+            fig_trav.update_xaxes(
+                title_text=f"{pv:+.2f}", showticklabels=False,
+                title_font=dict(size=9, color="#8b949e"), row=1, col=col_idx,
+            )
+            fig_trav.update_yaxes(visible=False, row=1, col=col_idx)
 
     fig_trav.update_layout(
-        plot_bgcolor="#0d1117", paper_bgcolor="#161b22",
-        margin=dict(l=5, r=5, t=10, b=20), height=140,
+        **PLOTLY_BASE, margin=dict(l=5, r=5, t=10, b=20), height=140,
     )
-    st.plotly_chart(fig_trav, width='stretch')
+    st.plotly_chart(fig_trav,  width='stretch')
 
 
 # ===========================================================================
@@ -1170,180 +1116,198 @@ elif page == "Reconstruction":
 elif page == "Visualisations avancees":
     st.markdown('<div class="section-title">Visualisations avancees</div>', unsafe_allow_html=True)
 
+    if st.session_state.model is None:
+        st.warning("Aucun modele en memoire. Lancez un entrainement ou chargez un checkpoint.")
+        st.stop()
+
+    model = st.session_state.model
+
+    if st.session_state.test_loader is None:
+        _, test_loader = get_dataloaders(128)
+        st.session_state.test_loader = test_loader
+
+    # Inference (cache session)
+    if st.session_state.eval_data is None:
+        with st.spinner("Calcul des representations sur le test set…"):
+            st.session_state.eval_data = run_full_eval(
+                model, st.session_state.test_loader, DEVICE, n_batches=40
+            )
+
+    ed     = st.session_state.eval_data
+    y_true = ed["y_true"]
+    y_pred = ed["y_pred"]
+    caps   = ed["caps"]    # (N, 10, 16)
+    images = ed["images"]  # (N, 1, 28, 28)
+
     tab1, tab2, tab3, tab4 = st.tabs([
         "Activations des capsules",
         "Heatmap des poids",
-        "Vecteurs capsules",
+        "Vecteurs capsules (PCA)",
         "Analyse des erreurs",
     ])
 
-    rng = np.random.default_rng(99)
-
+    # ------------------------------------------------------------------
     with tab1:
         st.markdown("#### Distribution des activations par capsule de classe")
         st.markdown(
-            "La norme du vecteur de chaque capsule digit encode la probabilite de presence de la classe. "
-            "Un modele bien entraine produit une capsule dominante clairement detachee des autres."
+            "Normes des 10 vecteurs capsules digit pour un exemple du test set. "
+            "Un modele converge produit une capsule dominante nettement au-dessus des autres."
         )
-        digit_selected = st.selectbox("Chiffre de reference (test)", list(range(10)), key="act_digit")
-        activations = rng.uniform(0.02, 0.15, 10)
-        activations[digit_selected] = rng.uniform(0.88, 0.97)
+        digit_sel = st.selectbox("Chiffre a visualiser", list(range(10)), key="tab1_digit")
 
-        fig_act = go.Figure(
-            go.Bar(
-                x=[str(i) for i in range(10)],
-                y=activations,
-                marker_color=["#1d4ed8" if i != digit_selected else "#3fb950" for i in range(10)],
-                marker_line_color="#21262d",
-                marker_line_width=1,
-                text=[f"{a:.3f}" for a in activations],
-                textposition="outside",
-                textfont=dict(color="#8b949e", size=10),
-            )
-        )
+        # Chercher le premier exemple correct de ce chiffre
+        mask_correct = (y_true == digit_sel) & (y_pred == digit_sel)
+        if mask_correct.any():
+            idx = int(np.where(mask_correct)[0][0])
+            cap_norms = np.linalg.norm(caps[idx], axis=-1)  # (10,)
+        else:
+            idx = int(np.where(y_true == digit_sel)[0][0])
+            cap_norms = np.linalg.norm(caps[idx], axis=-1)
+
+        fig_act = go.Figure(go.Bar(
+            x=[str(i) for i in range(10)],
+            y=cap_norms.tolist(),
+            marker_color=["#1d4ed8" if i != digit_sel else "#3fb950" for i in range(10)],
+            marker_line_color="#21262d", marker_line_width=1,
+            text=[f"{a:.3f}" for a in cap_norms],
+            textposition="outside",
+            textfont=dict(color="#8b949e", size=10),
+        ))
         fig_act.update_layout(
-            xaxis_title="Capsule (classe)",
-            yaxis_title="Norme du vecteur",
-            plot_bgcolor="#0d1117",
-            paper_bgcolor="#161b22",
-            font=dict(color="#8b949e"),
-            xaxis=dict(gridcolor="#21262d"),
-            yaxis=dict(gridcolor="#21262d", range=[0, 1.1]),
-            margin=dict(l=10, r=10, t=10, b=10),
-            height=320,
+            xaxis_title="Capsule digit", yaxis_title="Norme du vecteur",
+            **PLOTLY_BASE,
+            xaxis=AXIS_STYLE, yaxis={**AXIS_STYLE, "range": [0, cap_norms.max() * 1.2]},
+            margin=dict(l=10, r=10, t=10, b=10), height=320,
         )
-        st.plotly_chart(fig_act, width='stretch')
+        st.plotly_chart(fig_act,  width='stretch')
 
+        # Afficher l'image correspondante
+        col_img, _ = st.columns([1, 3])
+        with col_img:
+            img_np = images[idx].squeeze()
+            img_np = (img_np - img_np.min()) / (img_np.max() - img_np.min() + 1e-8)
+            fig_img = plotly_heatmap_img(img_np, title=f"Chiffre {digit_sel} (test)")
+            st.plotly_chart(fig_img,  width='stretch')
+
+    # ------------------------------------------------------------------
     with tab2:
-        st.markdown("#### Heatmap des poids — DigitCaps (agregee)")
+        st.markdown("#### Heatmap des poids W — DigitCaps")
         st.markdown(
-            "Visualisation de la matrice de couplage agregee entre les 1152 capsules primaires "
-            "et les 10 capsules digits apres convergence du routage."
+            "Norme des vecteurs de prediction u_hat pour chaque paire "
+            "(capsule primaire, capsule digit), aggregee sur les 32 premiers exemples."
         )
-        n_primary = 32
-        weight_matrix = rng.uniform(-1, 1, (n_primary, 10))
-        # Make dominant patterns
-        for cls in range(10):
-            weight_matrix[cls * 3 % n_primary, cls] += rng.uniform(1.5, 2.5)
+        model.eval()
+        # Extraire W directement depuis le module DigitCaps
+        W = model.digit_caps.W.detach().cpu().numpy()  # (10, 1152, 16, 8)
+        # Norme sur la dimension out_dim : (10, 1152)
+        W_norm = np.linalg.norm(W, axis=2)  # (10, 1152)
+        # Sous-echantillonner : regrouper par blocs de 32 primaires
+        W_agg = W_norm.reshape(10, -1, 32).mean(axis=2).T  # (36, 10)
 
         fig_hw = px.imshow(
-            weight_matrix,
-            color_continuous_scale="RdBu",
-            labels=dict(x="Capsule digit", y="Capsule primaire (echantillon)"),
+            W_agg, color_continuous_scale="Blues",
+            labels=dict(x="Capsule digit", y="Bloc de capsules primaires"),
             x=[str(i) for i in range(10)],
         )
         fig_hw.update_layout(
-            plot_bgcolor="#0d1117",
-            paper_bgcolor="#161b22",
-            font=dict(color="#8b949e"),
-            margin=dict(l=10, r=10, t=10, b=10),
-            height=420,
+            **PLOTLY_BASE, margin=dict(l=10, r=10, t=10, b=10), height=420,
         )
-        st.plotly_chart(fig_hw, width='stretch')
+        st.plotly_chart(fig_hw,  width='stretch')
 
+    # ------------------------------------------------------------------
     with tab3:
-        st.markdown("#### Projection 2D des vecteurs capsules (PCA)")
+        st.markdown("#### Projection 2D des vecteurs capsules — PCA")
         st.markdown(
-            "Projection en 2 dimensions des vecteurs capsules de dimension 16 pour 500 exemples de test. "
-            "Une bonne separation des clusters indique que les capsules ont appris des representations discriminantes."
+            "Chaque point est la projection du vecteur capsule de la vraie classe "
+            "(dim=16) en 2D par ACP. Une separation nette des clusters indique que "
+            "les capsules ont appris des representations discriminantes."
         )
-        n_points = 500
-        labels = rng.integers(0, 10, n_points)
-        # Simulate clustered embeddings
-        centers = rng.uniform(-8, 8, (10, 2))
-        points = np.array([centers[l] + rng.normal(0, 0.8, 2) for l in labels])
+        # Extraire les vecteurs de la vraie classe pour chaque exemple
+        true_caps = caps[np.arange(len(y_true)), y_true]  # (N, 16)
+
+        pca = PCA(n_components=2)
+        proj = pca.fit_transform(true_caps)  # (N, 2)
+        var  = pca.explained_variance_ratio_ * 100
 
         fig_pca = go.Figure()
         colors_pca = px.colors.qualitative.Plotly
         for cls in range(10):
-            mask = labels == cls
-            fig_pca.add_trace(
-                go.Scatter(
-                    x=points[mask, 0],
-                    y=points[mask, 1],
-                    mode="markers",
-                    name=str(cls),
-                    marker=dict(size=5, color=colors_pca[cls], opacity=0.75),
-                )
-            )
+            mask = y_true == cls
+            fig_pca.add_trace(go.Scatter(
+                x=proj[mask, 0], y=proj[mask, 1],
+                mode="markers", name=str(cls),
+                marker=dict(size=4, color=colors_pca[cls], opacity=0.7),
+            ))
         fig_pca.update_layout(
-            xaxis_title="Composante 1",
-            yaxis_title="Composante 2",
-            plot_bgcolor="#0d1117",
-            paper_bgcolor="#161b22",
-            font=dict(color="#8b949e"),
-            xaxis=dict(gridcolor="#21262d"),
-            yaxis=dict(gridcolor="#21262d"),
+            xaxis_title=f"PC1 ({var[0]:.1f}%)", yaxis_title=f"PC2 ({var[1]:.1f}%)",
+            **PLOTLY_BASE,
+            xaxis=AXIS_STYLE, yaxis=AXIS_STYLE,
             legend=dict(bgcolor="#161b22", bordercolor="#21262d", title="Classe"),
-            margin=dict(l=10, r=10, t=10, b=10),
-            height=420,
+            margin=dict(l=10, r=10, t=10, b=10), height=420,
         )
-        st.plotly_chart(fig_pca, width='stretch')
+        st.plotly_chart(fig_pca,  width='stretch')
 
+    # ------------------------------------------------------------------
     with tab4:
         st.markdown("#### Analyse des erreurs de classification")
+
+        correct_mask = y_true == y_pred
+        error_mask   = ~correct_mask
+
         col_a, col_b = st.columns(2)
 
-        with col_a:
-            st.markdown("**Exemples correctement classes**")
-            fig_ok = make_subplots(rows=2, cols=5, horizontal_spacing=0.01, vertical_spacing=0.05)
-            for idx in range(10):
-                img_ok = rng.uniform(0, 0.1, (28, 28))
-                img_ok[8:20, 8:20] += rng.uniform(0.6, 0.9, (12, 12))
-                img_ok = np.clip(img_ok, 0, 1)
-                r, c = idx // 5 + 1, idx % 5 + 1
-                fig_ok.add_trace(go.Heatmap(z=img_ok, colorscale="gray", showscale=False, zmin=0, zmax=1), row=r, col=c)
-                fig_ok.update_xaxes(visible=False, row=r, col=c)
-                fig_ok.update_yaxes(visible=False, row=r, col=c)
-            fig_ok.update_layout(
-                paper_bgcolor="#161b22", plot_bgcolor="#0d1117",
-                margin=dict(l=0, r=0, t=0, b=0), height=180,
+        def show_grid(title, indices, n=10):
+            n = min(n, len(indices))
+            if n == 0:
+                st.markdown(f"*Aucun exemple disponible pour : {title}*")
+                return
+            cols_g = min(5, n)
+            rows_g = (n + cols_g - 1) // cols_g
+            fig_g = make_subplots(rows=rows_g, cols=cols_g,
+                                  horizontal_spacing=0.01, vertical_spacing=0.05)
+            for k, idx in enumerate(indices[:n]):
+                r_g, c_g = k // cols_g + 1, k % cols_g + 1
+                img_g = images[idx].squeeze()
+                img_g = (img_g - img_g.min()) / (img_g.max() - img_g.min() + 1e-8)
+                fig_g.add_trace(
+                    go.Heatmap(z=img_g, colorscale="gray", showscale=False, zmin=0, zmax=1),
+                    row=r_g, col=c_g,
+                )
+                lbl = str(y_true[idx]) if error_mask.sum() == 0 else f"{y_true[idx]}→{y_pred[idx]}"
+                fig_g.update_xaxes(
+                    title_text=lbl, showticklabels=False,
+                    title_font=dict(size=8, color="#8b949e"), row=r_g, col=c_g,
+                )
+                fig_g.update_yaxes(visible=False, row=r_g, col=c_g)
+            fig_g.update_layout(
+                **PLOTLY_BASE,
+                margin=dict(l=0, r=0, t=0, b=20),
+                height=130 * rows_g,
             )
-            st.plotly_chart(fig_ok, width='stretch')
+            st.markdown(f"**{title}**")
+            st.plotly_chart(fig_g,  width='stretch')
+
+        with col_a:
+            correct_idxs = np.where(correct_mask)[0][:10]
+            show_grid("Exemples correctement classes", correct_idxs)
 
         with col_b:
-            st.markdown("**Exemples incorrectement classes**")
-            error_pairs = [(rng.integers(0, 10), rng.integers(0, 10)) for _ in range(10)]
-            fig_err = make_subplots(rows=2, cols=5, horizontal_spacing=0.01, vertical_spacing=0.05)
-            for idx, (true_cls, pred_cls) in enumerate(error_pairs[:10]):
-                img_err = rng.uniform(0, 0.15, (28, 28))
-                img_err[7:21, 7:21] += rng.uniform(0.4, 0.7, (14, 14))
-                img_err = np.clip(img_err, 0, 1)
-                r, c = idx // 5 + 1, idx % 5 + 1
-                fig_err.add_trace(go.Heatmap(z=img_err, colorscale="gray", showscale=False, zmin=0, zmax=1), row=r, col=c)
-                fig_err.update_xaxes(
-                    title_text=f"{true_cls}->{pred_cls}", showticklabels=False,
-                    title_font=dict(size=8, color="#f85149"),
-                    row=r, col=c,
-                )
-                fig_err.update_yaxes(visible=False, row=r, col=c)
-            fig_err.update_layout(
-                paper_bgcolor="#161b22", plot_bgcolor="#0d1117",
-                margin=dict(l=0, r=0, t=0, b=20), height=200,
-            )
-            st.plotly_chart(fig_err, width='stretch')
+            error_idxs = np.where(error_mask)[0][:10]
+            show_grid("Exemples incorrectement classes (vrai → predit)", error_idxs)
 
-        st.markdown("**Matrice des confusions les plus frequentes**")
-        confusion_freq = rng.integers(0, 30, (10, 10))
-        np.fill_diagonal(confusion_freq, 0)
-
-        fig_top = px.imshow(
-            confusion_freq,
-            color_continuous_scale="Reds",
-            text_auto=True,
-            x=[str(i) for i in range(10)],
-            y=[str(i) for i in range(10)],
+        st.markdown("**Matrice des confusions hors-diagonale**")
+        cm_err = confusion_matrix(y_true, y_pred)
+        np.fill_diagonal(cm_err, 0)
+        fig_err = px.imshow(
+            cm_err, color_continuous_scale="Reds", text_auto=True,
+            x=[str(i) for i in range(10)], y=[str(i) for i in range(10)],
             labels=dict(x="Classe predite", y="Classe reelle"),
         )
-        fig_top.update_layout(
-            plot_bgcolor="#0d1117",
-            paper_bgcolor="#161b22",
-            font=dict(color="#8b949e"),
-            coloraxis_showscale=False,
-            margin=dict(l=10, r=10, t=10, b=10),
-            height=340,
+        fig_err.update_layout(
+            **PLOTLY_BASE, coloraxis_showscale=False,
+            margin=dict(l=10, r=10, t=10, b=10), height=360,
         )
-        st.plotly_chart(fig_top, width='stretch')
+        st.plotly_chart(fig_err,  width='stretch')
 
 
 # ===========================================================================
@@ -1360,39 +1324,36 @@ elif page == "A propos":
             """
 **Capsule Network for MNIST Classification and Reconstruction**
 
-Ce projet implemente le modele CapsNet decrit dans l'article fondateur de Sabour, Frosst et Hinton (2017).
-Il couvre l'architecture complete — convolution, capsules primaires, capsules digits et decodeur —
-ainsi que le mecanisme de routage dynamique. Le dashboard Streamlit permet de former, evaluer et
-explorer le comportement du modele de maniere interactive.
+Ce projet implemente le modele CapsNet decrit dans l'article fondateur de Sabour, Frosst et
+Hinton (NeurIPS 2017). Il couvre l'architecture complete — convolution, capsules primaires,
+capsules digits et decodeur — ainsi que le mecanisme de routage dynamique. Le dashboard
+Streamlit permet de former, evaluer et explorer le comportement du modele de maniere
+interactive, en s'appuyant directement sur les modules model.py, train.py et utils.py du
+projet.
 """
         )
 
         st.markdown("### Reference scientifique")
         st.markdown(
             '<div class="arch-block">'
-            '<h4>Dynamic Routing Between Capsules</h4>'
-            '<p>Sara Sabour, Nicholas Frosst, Geoffrey E. Hinton<br/>'
+            "<h4>Dynamic Routing Between Capsules</h4>"
+            "<p>Sara Sabour, Nicholas Frosst, Geoffrey E. Hinton<br/>"
             "31st Conference on Neural Information Processing Systems (NeurIPS 2017)<br/>"
-            "Long Beach, CA, USA<br/>"
-            "arXiv : 1710.09829</p>"
+            "Long Beach, CA, USA — arXiv : 1710.09829</p>"
             "</div>",
             unsafe_allow_html=True,
         )
 
         st.markdown("### Technologies")
         techs = [
-            ("Python", "3.9+"),
-            ("PyTorch", "2.x"),
-            ("Streamlit", "1.x"),
-            ("Plotly", "5.x"),
-            ("NumPy", "1.24+"),
-            ("scikit-learn", "1.x"),
+            ("Python", "3.9+"), ("PyTorch", "2.x"), ("Streamlit", "1.x"),
+            ("Plotly", "5.x"), ("NumPy", "1.24+"), ("scikit-learn", "1.x"),
             ("Pillow", "10.x"),
         ]
-        badges = "".join(
-            f'<span class="badge">{name} {ver}</span>' for name, ver in techs
+        st.markdown(
+            "".join(f'<span class="badge">{n} {v}</span>' for n, v in techs),
+            unsafe_allow_html=True,
         )
-        st.markdown(badges, unsafe_allow_html=True)
 
     with col_right:
         st.markdown("### Auteur")
@@ -1413,33 +1374,37 @@ explorer le comportement du modele de maniere interactive.
         st.markdown(
             '<div class="arch-block" style="border-left-color:#d29922;">'
             "<h4>MIT License</h4>"
-            "<p>Permission is hereby granted, free of charge, to any person obtaining a copy "
+            "<p>Copyright (c) 2024 — Votre Nom.<br/>"
+            "Permission is hereby granted, free of charge, to any person obtaining a copy "
             "of this software and associated documentation files (the \"Software\"), to deal "
-            "in the Software without restriction, including without limitation the rights to use, "
-            "copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, "
-            "and to permit persons to whom the Software is furnished to do so, subject to the "
-            "following conditions: The above copyright notice and this permission notice shall be "
-            "included in all copies or substantial portions of the Software. "
-            "THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED.</p>"
+            "in the Software without restriction, including without limitation the rights to "
+            "use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies "
+            "of the Software, and to permit persons to whom the Software is furnished to do "
+            "so, subject to the following conditions: The above copyright notice and this "
+            "permission notice shall be included in all copies or substantial portions of "
+            "the Software. THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, "
+            "EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF "
+            "MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.</p>"
             "</div>",
             unsafe_allow_html=True,
         )
 
         st.markdown("### Structure du projet")
         st.code(
-            """CapsNet_Project/
-├── app.py          # Dashboard Streamlit
-├── model.py        # CapsNet, PrimaryCaps, DigitCaps, Decoder
-├── train.py        # train_model, evaluate_model
-├── utils.py        # load_data, set_seed
-├── requirements.txt
-└── LICENSE""",
+            "CapsNet_Project/\n"
+            "├── app.py          # Dashboard Streamlit\n"
+            "├── model.py        # CapsNet, PrimaryCaps, DigitCaps, Decoder, CapsLoss\n"
+            "├── train.py        # train(), test()\n"
+            "├── utils.py        # set_seed(), get_dataloaders()\n"
+            "├── requirements.txt\n"
+            "└── LICENSE",
             language="text",
         )
 
     st.markdown("<br/><hr/>", unsafe_allow_html=True)
     st.markdown(
-        '<div style="text-align:center; color:#8b949e; font-size:0.8rem; font-family:JetBrains Mono,monospace;">'
+        '<div style="text-align:center;color:#8b949e;font-size:0.8rem;'
+        'font-family:JetBrains Mono,monospace;">'
         "CapsNet Dashboard — Sabour, Frosst &amp; Hinton (2017) — Streamlit + PyTorch"
         "</div>",
         unsafe_allow_html=True,
